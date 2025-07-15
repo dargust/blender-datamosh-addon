@@ -99,7 +99,7 @@ class DATAMOSH_OT_run_datamosh(bpy.types.Operator):
 
     def create_datamoshed_avi_step(self):
         print(f"Creating datamoshed AVI: {self.output_file}")
-        create_datamoshed_avi(self.avi_data, self.temp_file, self.output_file, start_at=self.start_points, end_at=self.end_points, duplicated_p_frames=0, transition_frames=self.start_frames)
+        create_datamoshed_avi(self.avi_data, self.temp_file, self.output_file, start_at=self.start_points, end_at=self.end_points, duplicated_p_frames=1, transition_frames=self.start_frames)
 
     def add_movie_strip_step(self):
         print(f"Adding movie strip: {self.output_file}")

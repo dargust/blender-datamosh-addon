@@ -170,91 +170,105 @@ def extract_avi_data(input_file):
 
     return {"riff": riff_data, "hdrl": hdrl_data, "movi": movi_data, "idx1": idx1_data}
 
-def create_datamoshed_avi(avi_data, input_filename, output_filename, start_at=2, end_at=1000, duplicated_p_frames=1, transition_frames=None):
+def create_datamoshed_avi(avi_data, input_filename, output_filename, start_at=[0], end_at=[999999], duplicated_p_frames=0, transition_frames=None):
     print("#### Datamoshing AVI file...")
-    print("removing I-frames and replacing them with duplicated P-frames...")
-    print(f"start points: {start_at}, end points: {end_at}, transitions: {transition_frames}")
-    new_file_data = bytearray()
-    print_writes = False
+    print(f"start_at: {start_at}, end_at: {end_at}, transitions: {transition_frames}")
+    transition_frames = transition_frames or []
+
     with open(input_filename, "rb") as f_in:
-        raw_file_data = f_in.read()
-        riff_start = avi_data["riff"]["start"]
-        hdrl_start = avi_data["hdrl"]["start"]
-        movi_start = avi_data["movi"]["start"]
-        idx1_start = avi_data["idx1"]["start"]
-        # Don't modify the RIFF chunk
-        new_file_data.extend(raw_file_data[riff_start:hdrl_start])
-        if print_writes: print(f"writing riff from {riff_start} to {hdrl_start}")
-        # Don't modify the HDLR/AVIH chunk
-        new_file_data.extend(raw_file_data[hdrl_start:movi_start])
-        if print_writes: print(f"writing hdrl from {hdrl_start} to {movi_start}")
-        # Modify the MOVI chunk by removing I-frames and duplicating P-frames
-        modified_frame_starts = []
-        modified_frame_ends = []
-        first_frame_start = avi_data["movi"]["frame_data"]["frame_data"][0]["start"]
-        new_file_data.extend(raw_file_data[movi_start:first_frame_start])
-        if print_writes: print(f"writing movi from {movi_start} to {first_frame_start}")
-        frame_count = len(avi_data["movi"]["frame_data"]["frame_data"])
-        last_frame_binary = None
-        skipped_frames = 0
-        removing = False
-        for i in range(frame_count):
-            frame = avi_data["movi"]["frame_data"]["frame_data"][i]
-            frame_start = frame["start"]
-            next_frame_start = avi_data["movi"]["frame_data"]["frame_data"][i + 1]["start"] if i + 1 < frame_count else idx1_start
-            frame_type = avi_data["movi"]["frame_data"]["frame_types"][i]
-            raw_binary = raw_file_data[frame_start:next_frame_start]
-            if not i in transition_frames:
-                if any([(start_at[q] <= i <= end_at[q]) for q in range(len(start_at))]):
-                    if not removing:
-                        print(f"removing I-frames from frame {i}...")
-                    removing = True
-                    if frame_type == FrameType.I.value:
-                        print(f"    swapping I-frame at {i}")
-                        raw_binary = last_frame_binary
-                        new_file_data.extend(last_frame_binary)
-                        for j in range(duplicated_p_frames):
-                            new_file_data.extend(last_frame_binary)
-                            skipped_frames -= 1
-                    else:
-                        pass
-                        new_file_data.extend(raw_binary)
-                else:
-                    if removing:
-                        print(f"resuming I-frames at frame {i}")
-                    removing = False
-                    new_file_data.extend(raw_binary)
+        raw_data = f_in.read()
+
+    riff_start = avi_data["riff"]["start"]
+    hdrl_start = avi_data["hdrl"]["start"]
+    movi_start = avi_data["movi"]["start"]
+    idx1_start = avi_data["idx1"]["start"]
+    frame_count = len(avi_data["movi"]["frame_data"]["frame_data"])
+
+    new_file = bytearray()
+    new_file.extend(raw_data[riff_start:hdrl_start])       # RIFF chunk
+    new_file.extend(raw_data[hdrl_start:movi_start])       # HDRL chunk
+
+    # MOVI chunk header
+    movi_header_start = movi_start
+    first_frame_start = avi_data["movi"]["frame_data"]["frame_data"][0]["start"]
+    new_file.extend(raw_data[movi_start:first_frame_start])
+
+    new_idx1_entries = []
+    last_p_frame_binary = None
+
+    def get_offset():
+        return len(new_file) - riff_start
+
+    # Start processing frames
+    for i in range(frame_count):
+        frame_info = avi_data["movi"]["frame_data"]["frame_data"][i]
+        frame_start = frame_info["start"]
+        next_start = avi_data["movi"]["frame_data"]["frame_data"][i + 1]["start"] if i + 1 < frame_count else idx1_start
+        frame_type = avi_data["movi"]["frame_data"]["frame_types"][i]
+        original_frame = raw_data[frame_start:next_start]
+
+        should_glitch = any(start_at[j] <= i <= end_at[j] for j in range(len(start_at)))
+        is_transition = i in transition_frames
+
+        if is_transition:
+            print(f"Skipping frame {i} for transition.")
+            continue
+
+        if frame_type == FrameType.P.value:
+            last_p_frame_binary = original_frame
+
+        if should_glitch and frame_type == FrameType.I.value:
+            print(f"Replacing I-frame at {i}...")
+            if last_p_frame_binary:
+                for _ in range(1 + duplicated_p_frames):
+                    offset = get_offset()
+                    new_file.extend(last_p_frame_binary)
+                    new_idx1_entries.append({
+                        "chunk_id": b"00dc",
+                        "flags": 0x00,
+                        "offset": offset,
+                        "size": len(last_p_frame_binary) - 8
+                    })
             else:
-                print(f"    explicitly skipping frame {i} for transition...")
-                skipped_frames += 1
-            if print_writes: print(f"writing fram from {frame_start} to {next_frame_start}, type: {frame_type}")
-            if frame_type == FrameType.P.value:
-                last_frame_binary = raw_binary
-        new_file_data.extend(raw_file_data[next_frame_start:idx1_start])
-        if print_writes: print(f"writing mend from {next_frame_start} to {idx1_start}")
+                print(f"  ⚠️ No P-frame available to replace I-frame at {i}, skipping.")
+        else:
+            offset = get_offset()
+            new_file.extend(original_frame)
+            new_idx1_entries.append({
+                "chunk_id": b"00dc",
+                "flags": 0x10 if frame_type == FrameType.I.value else 0x00,
+                "offset": offset,
+                "size": len(original_frame) - 8
+            })
 
-        # Modify the IDX1 chunk by updating the index entries
-        for entry in avi_data["idx1"]["entries"]:
-            chunk_id = entry["chunk_id"]
-            flags = entry["flags"]
-            offset = entry["offset"]
-            size = entry["size"]
-            new_file_data.extend(chunk_id)
-            new_file_data.extend(struct.pack('<I', flags))
-            new_file_data.extend(struct.pack('<I', offset))
-            new_file_data.extend(struct.pack('<I', size))
-        new_file_data.extend(raw_file_data[avi_data["idx1"]["end"]:])
+    # Finish MOVI chunk (nothing to add between movi and idx1)
+    idx1_offset = get_offset()
+    new_file.extend(b"idx1")
+    new_file.extend(struct.pack('<I', len(new_idx1_entries) * 16))
 
-        if print_writes: print(f"writing idx1 from {idx1_start} to end")
-    
-    new_frame_count = len(avi_data["movi"]["frame_data"]["frame_data"]) - skipped_frames
-    print(f"Old frame count: {len(avi_data['movi']['frame_data']['frame_data'])}, new frame count: {new_frame_count}")
-    struct.pack_into('<I', new_file_data, 16, new_frame_count)
-    
+    for entry in new_idx1_entries:
+        new_file.extend(entry["chunk_id"])
+        new_file.extend(struct.pack("<I", entry["flags"]))
+        new_file.extend(struct.pack("<I", entry["offset"]))
+        new_file.extend(struct.pack("<I", entry["size"]))
+
+    # Fix RIFF header size
+    final_file_size = len(new_file)
+    riff_size = final_file_size - 8
+    struct.pack_into('<I', new_file, 4, riff_size)
+
+    # Fix total frame count in avih
+    new_frame_count = len(new_idx1_entries)
+    avih_frame_count_offset = avi_data["hdrl"]["avih"]["start"] + 24
+    struct.pack_into('<I', new_file, avih_frame_count_offset, new_frame_count)
+
+    print(f"Old frame count: {frame_count}, new frame count: {new_frame_count}")
+    print(f"Final file size: {final_file_size} bytes")
 
     with open(output_filename, "wb") as f_out:
-        f_out.write(new_file_data)
-    print(f"#### Datamosh complete. Saved to: {output_filename}")
+        f_out.write(new_file)
+    print(f"#### Datamosh complete: {output_filename}")
+
 
 if __name__ == "__main__":
     # Example usage
