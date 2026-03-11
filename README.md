@@ -1,4 +1,5 @@
 # Blender Datamosh Addon
+web usable tool at https://dacus.uk/datamosh/
 
 This Blender addon allows users to perform datamoshing on video clips rendered from Blender's Video Sequence Editor (VSE). It automatically identifies transition points between clips and applies the datamoshing effect to the rendered video.
 
