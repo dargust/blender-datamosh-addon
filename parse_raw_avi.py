@@ -19,6 +19,7 @@
 from enum import Enum
 import struct
 import subprocess
+import os
 debug_global = 0
 
 # Convert to AVI (Xvid is best for datamoshing)
@@ -93,17 +94,40 @@ def collect_frame_data(avi_data, movi_start, total_frames):
     #global debug_global
     frame_data = []
     frame_types = []
+    current_pos = movi_start + 8  # Skip "movi" + size header
+    
     for i in range(total_frames):
-        frame_start = avi_data.find(b"00dc", movi_start)
+        # Find next frame chunk
+        frame_start = avi_data.find(b"00dc", current_pos)
+        if frame_start == -1:
+            print(f"Warning: Could not find frame {i} at position {current_pos}")
+            break
+            
         frame_size = int.from_bytes(avi_data[frame_start + 4:frame_start + 8], "little")
-        frame_data.append({"start": frame_start, "size": frame_size, "data": avi_data[frame_start:frame_start + frame_size + 8]})
+        frame_end = frame_start + frame_size + 8
+        
+        # Ensure we don't read beyond the data
+        if frame_end > len(avi_data):
+            print(f"Warning: Frame {i} extends beyond file boundary")
+            break
+            
+        frame_data.append({
+            "start": frame_start, 
+            "size": frame_size, 
+            "data": avi_data[frame_start:frame_end]
+        })
+        
         # Work out if the frame is an I frame or a B/P frame
-        frame_type = avi_data[frame_start + 11:frame_start + 12]
+        if frame_start + 11 < len(avi_data):
+            frame_type = avi_data[frame_start + 11:frame_start + 12]
+        else:
+            frame_type = b'\x00'  # Default if we can't read
         frame_types.append(frame_type)
-        #if debug_global == 3:
-        #    print(f"frame type: {frame_type}")
-        #debug_global += 1
-        movi_start = frame_start + frame_size
+        
+        # Move to next frame (include padding if odd size)
+        current_pos = frame_end
+        if frame_size % 2 == 1:
+            current_pos += 1  # Skip padding byte
         
     return {"frame_data": frame_data, "frame_types": frame_types}
     
@@ -178,26 +202,58 @@ def create_datamoshed_avi(avi_data, input_filename, output_filename, start_at=[0
     with open(input_filename, "rb") as f_in:
         raw_data = f_in.read()
 
+    # Validate input data
+    if not raw_data.startswith(b"RIFF"):
+        raise ValueError("Invalid AVI file: Missing RIFF header")
+    
+    if b"AVI " not in raw_data[:12]:
+        raise ValueError("Invalid AVI file: Not an AVI file")
+
     riff_start = avi_data["riff"]["start"]
     hdrl_start = avi_data["hdrl"]["start"]
     movi_start = avi_data["movi"]["start"]
     idx1_start = avi_data["idx1"]["start"]
     frame_count = len(avi_data["movi"]["frame_data"]["frame_data"])
+    
+    if frame_count == 0:
+        raise ValueError("No frames found in AVI file")
 
     new_file = bytearray()
     new_file.extend(raw_data[riff_start:hdrl_start])       # RIFF chunk
     new_file.extend(raw_data[hdrl_start:movi_start])       # HDRL chunk
 
     # MOVI chunk header
-    movi_header_start = movi_start
     first_frame_start = avi_data["movi"]["frame_data"]["frame_data"][0]["start"]
     new_file.extend(raw_data[movi_start:first_frame_start])
+    
+    # Track where movi data starts in the new file (after movi header)
+    movi_data_start_in_new_file = len(new_file)
 
     new_idx1_entries = []
     last_p_frame_binary = None
 
     def get_offset():
-        return len(new_file) - riff_start
+        return len(new_file) - movi_data_start_in_new_file  # Offset from start of movi data
+
+    def add_padding_if_needed():
+        # Ensure word alignment (2-byte boundary)
+        if len(new_file) % 2 == 1:
+            new_file.extend(b'\x00')
+
+    def idx_size_from_chunk(chunk: bytes) -> int:
+        # Size reported in the chunk header
+        if len(chunk) < 8:
+            return 0
+        header_size = struct.unpack("<I", chunk[4:8])[0]
+        # Actual payload length (exclude 8-byte header, and exclude 1-byte padding if present)
+        payload_len = max(0, len(chunk) - 8)
+        if payload_len % 2 == 1:
+            payload_len -= 1  # drop padding for idx1 size
+        # Use the smaller of the declared and actual (defensive)
+        return max(0, min(header_size, payload_len))
+
+    def chunk_id_from_chunk(chunk: bytes) -> bytes:
+        return chunk[0:4] if len(chunk) >= 4 else b"00dc"
 
     # Start processing frames
     for i in range(frame_count):
@@ -223,26 +279,33 @@ def create_datamoshed_avi(avi_data, input_filename, output_filename, start_at=[0
                 for _ in range(1 + duplicated_p_frames):
                     offset = get_offset()
                     new_file.extend(last_p_frame_binary)
+                    add_padding_if_needed()
                     new_idx1_entries.append({
-                        "chunk_id": b"00dc",
-                        "flags": 0x00,
+                        "chunk_id": chunk_id_from_chunk(last_p_frame_binary),
+                        "flags": 0x00,  # duplicated P => not keyframe
                         "offset": offset,
-                        "size": len(last_p_frame_binary) - 8
+                        "size": idx_size_from_chunk(last_p_frame_binary)
                     })
             else:
                 print(f"  ⚠️ No P-frame available to replace I-frame at {i}, skipping.")
         else:
             offset = get_offset()
             new_file.extend(original_frame)
+            add_padding_if_needed()
             new_idx1_entries.append({
-                "chunk_id": b"00dc",
+                "chunk_id": chunk_id_from_chunk(original_frame),
                 "flags": 0x10 if frame_type == FrameType.I.value else 0x00,
                 "offset": offset,
-                "size": len(original_frame) - 8
+                "size": idx_size_from_chunk(original_frame)
             })
 
-    # Finish MOVI chunk (nothing to add between movi and idx1)
-    idx1_offset = get_offset()
+    # Calculate and update MOVI chunk size
+    movi_data_size = len(new_file) - movi_data_start_in_new_file
+    # Make offset relative to start of new_file (which begins at riff_start)
+    movi_size_offset = (movi_start - riff_start) + 4
+    struct.pack_into('<I', new_file, movi_size_offset, movi_data_size)
+
+    # Add idx1 chunk
     new_file.extend(b"idx1")
     new_file.extend(struct.pack('<I', len(new_idx1_entries) * 16))
 
@@ -250,7 +313,13 @@ def create_datamoshed_avi(avi_data, input_filename, output_filename, start_at=[0
         new_file.extend(entry["chunk_id"])
         new_file.extend(struct.pack("<I", entry["flags"]))
         new_file.extend(struct.pack("<I", entry["offset"]))
-        new_file.extend(struct.pack("<I", entry["size"]))
+        # Guard to avoid out-of-range pack
+        size_val = entry["size"]
+        if size_val < 0:
+            size_val = 0
+        elif size_val > 0xFFFFFFFF:
+            size_val = 0xFFFFFFFF
+        new_file.extend(struct.pack("<I", size_val))
 
     # Fix RIFF header size
     final_file_size = len(new_file)
@@ -259,15 +328,30 @@ def create_datamoshed_avi(avi_data, input_filename, output_filename, start_at=[0
 
     # Fix total frame count in avih
     new_frame_count = len(new_idx1_entries)
-    avih_frame_count_offset = avi_data["hdrl"]["avih"]["start"] + 24
+    avih_frame_count_offset = avi_data["hdrl"]["avih"]["start"] + 24 - riff_start
     struct.pack_into('<I', new_file, avih_frame_count_offset, new_frame_count)
 
     print(f"Old frame count: {frame_count}, new frame count: {new_frame_count}")
     print(f"Final file size: {final_file_size} bytes")
 
+    # Basic validation
+    if new_frame_count == 0:
+        raise ValueError("No frames remaining after datamoshing")
+    
+    if final_file_size < 1024:  # Very small files are likely corrupted
+        raise ValueError("Generated file too small, likely corrupted")
+
     with open(output_filename, "wb") as f_out:
         f_out.write(new_file)
     print(f"#### Datamosh complete: {output_filename}")
+    
+    # Verify the output file
+    if not os.path.exists(output_filename):
+        raise ValueError("Failed to create output file")
+    
+    output_size = os.path.getsize(output_filename)
+    if output_size != final_file_size:
+        raise ValueError(f"File size mismatch: expected {final_file_size}, got {output_size}")
 
 
 if __name__ == "__main__":

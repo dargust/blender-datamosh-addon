@@ -19,7 +19,7 @@
 bl_info = {
     "name": "Datamosh Video",
     "author": "Dan Argust",
-    "version": (0, 2, 8),
+    "version": (0, 3, 7),
     "blender": (2, 82, 0),
     "category": "Video Tools",
 }
