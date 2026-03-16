@@ -31,5 +31,5 @@ This Blender addon allows users to perform datamoshing on video clips rendered f
 
 ## Dependencies
 
-- Blender 2.8 or higher
+- Blender 2.8 to 4.5
 - Python 3.7 or higher
